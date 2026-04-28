@@ -1,0 +1,102 @@
+# BudgetWatch — Docker Compose deployment
+#
+# This file runs the full BudgetWatch backend stack and integrates with
+# the existing Traefik reverse proxy on the VPS (running in n8n_default network).
+# Traefik will automatically:
+#   1. Discover the budgetwatch-api container
+#   2. Provision a Let's Encrypt SSL cert for api.sonducts.com
+#   3. Route HTTPS traffic to the FastAPI on internal port 8000
+
+services:
+
+  # -------------------------------------------------------------------
+  # Postgres — stores LineItem records, ingest history
+  # No external port. Only reachable from budgetwatch-api on the
+  # internal 'budgetwatch' network.
+  # -------------------------------------------------------------------
+  budgetwatch-db:
+    image: postgres:16-alpine
+    container_name: budgetwatch-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: budgetwatch
+      POSTGRES_USER: budgetwatch
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - budgetwatch-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U budgetwatch -d budgetwatch"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - budgetwatch-internal
+
+  # -------------------------------------------------------------------
+  # FastAPI backend — the public API
+  # -------------------------------------------------------------------
+  budgetwatch-api:
+    build: ./budgetwatch
+    container_name: budgetwatch-api
+    restart: unless-stopped
+    depends_on:
+      budgetwatch-db:
+        condition: service_healthy
+    environment:
+      BUDGETWATCH_DB_URL: postgresql://budgetwatch:${POSTGRES_PASSWORD}@budgetwatch-db:5432/budgetwatch
+      BUDGETWATCH_ADMIN_TOKEN: ${ADMIN_TOKEN}
+      BUDGETWATCH_RAW_DIR: /var/budgetwatch/raw
+      BUDGETWATCH_ALLOWED_ORIGIN: ${FRONTEND_ORIGIN}
+    volumes:
+      - budgetwatch-raw:/var/budgetwatch/raw
+    networks:
+      - budgetwatch-internal
+      - n8n_default              # to communicate with Traefik
+    labels:
+      # ----- Traefik routing -----
+      - "traefik.enable=true"
+      - "traefik.docker.network=n8n_default"
+
+      # HTTPS router for api.sonducts.com
+      - "traefik.http.routers.budgetwatch.rule=Host(`api.sonducts.com`)"
+      - "traefik.http.routers.budgetwatch.entrypoints=websecure"
+      - "traefik.http.routers.budgetwatch.tls.certresolver=letsencrypt"
+      - "traefik.http.services.budgetwatch.loadbalancer.server.port=8000"
+
+      # HTTP→HTTPS redirect
+      - "traefik.http.routers.budgetwatch-http.rule=Host(`api.sonducts.com`)"
+      - "traefik.http.routers.budgetwatch-http.entrypoints=web"
+      - "traefik.http.routers.budgetwatch-http.middlewares=https-redirect"
+      - "traefik.http.middlewares.https-redirect.redirectscheme.scheme=https"
+
+  # -------------------------------------------------------------------
+  # Cron — runs daily ingestion at 04:00 WIB (21:00 UTC the day before)
+  # -------------------------------------------------------------------
+  budgetwatch-cron:
+    image: alpine:3.20
+    container_name: budgetwatch-cron
+    restart: unless-stopped
+    depends_on:
+      - budgetwatch-api
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+    command: |
+      sh -c '
+        apk add --no-cache curl tzdata 2>/dev/null
+        cp /usr/share/zoneinfo/Asia/Jakarta /etc/localtime 2>/dev/null
+        echo "Asia/Jakarta" > /etc/timezone 2>/dev/null
+        echo "0 4 * * * curl -X POST -H \"Authorization: Bearer $$ADMIN_TOKEN\" http://budgetwatch-api:8000/admin/ingest/dki-jakarta >> /var/log/cron.log 2>&1" | crontab -
+        crond -f -L /var/log/cron.log
+      '
+    networks:
+      - budgetwatch-internal
+
+volumes:
+  budgetwatch-pgdata:
+  budgetwatch-raw:
+
+networks:
+  budgetwatch-internal:
+    driver: bridge
+  n8n_default:
+    external: true
